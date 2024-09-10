@@ -50,6 +50,7 @@ type llmServer struct {
 	status      *StatusWriter
 	options     api.Options
 	numParallel int
+	model       *loadedModel
 
 	estimate    MemoryEstimate
 	totalLayers uint64
@@ -396,6 +397,9 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 		}
 
 		server := filepath.Join(dir, "ollama_llama_server")
+		if envconfig.NewRunners() {
+			server = filepath.Join(dir, "ollama_runner")
+		}
 		if runtime.GOOS == "windows" {
 			server += ".exe"
 		}
@@ -403,6 +407,9 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 		// Detect tmp cleaners wiping out the file
 		_, err := os.Stat(server)
 		if errors.Is(err, os.ErrNotExist) {
+			if envconfig.NewRunners() {
+				return nil, fmt.Errorf("experimental runners enabled, but not present in this build")
+			}
 			slog.Warn("llama server disappeared, reinitializing payloads", "path", server, "error", err)
 			err = Init()
 			if err != nil {
@@ -411,11 +418,19 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 			}
 		}
 
+		var m *loadedModel
+		if envconfig.NewRunners() {
+			m, err = loadModel(model, true)
+			if err != nil {
+				return nil, fmt.Errorf("unable to load model for tokenization %w", err)
+			}
+		}
 		s := &llmServer{
 			port:        port,
 			cmd:         exec.Command(server, finalParams...),
 			status:      NewStatusWriter(os.Stderr),
 			options:     opts,
+			model:       m,
 			estimate:    estimate,
 			numParallel: numParallel,
 			sem:         semaphore.NewWeighted(int64(numParallel)),
@@ -889,16 +904,16 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 				continue
 			}
 
+			// slog.Debug("got line", "line", string(line))
 			evt, ok := bytes.CutPrefix(line, []byte("data: "))
 			if !ok {
-				return fmt.Errorf("error parsing llm response stream: %s", line)
+				evt = line
 			}
 
 			var c completion
 			if err := json.Unmarshal(evt, &c); err != nil {
 				return fmt.Errorf("error unmarshalling llm prediction response: %v", err)
 			}
-
 			switch {
 			case strings.TrimSpace(c.Content) == lastToken:
 				tokenRepeat++
@@ -1000,7 +1015,7 @@ func (s *llmServer) Embedding(ctx context.Context, input string) ([]float32, err
 	}
 
 	if resp.StatusCode >= 400 {
-		log.Printf("llm encode error: %s", body)
+		log.Printf("llm embedding error: %s", body)
 		return nil, fmt.Errorf("%s", body)
 	}
 
@@ -1021,6 +1036,10 @@ type TokenizeResponse struct {
 }
 
 func (s *llmServer) Tokenize(ctx context.Context, content string) ([]int, error) {
+	if envconfig.NewRunners() {
+		return tokenize(s.model, content)
+	}
+
 	// Make sure the server is ready
 	status, err := s.getServerStatus(ctx)
 	if err != nil {
@@ -1073,6 +1092,9 @@ type DetokenizeResponse struct {
 }
 
 func (s *llmServer) Detokenize(ctx context.Context, tokens []int) (string, error) {
+	if envconfig.NewRunners() {
+		return detokenize(s.model, tokens), nil
+	}
 	// Make sure the server is ready
 	status, err := s.getServerStatus(ctx)
 	if err != nil {
@@ -1117,6 +1139,10 @@ func (s *llmServer) Detokenize(ctx context.Context, tokens []int) (string, error
 }
 
 func (s *llmServer) Close() error {
+	if s.model != nil {
+		freeModel(s.model)
+		s.model = nil
+	}
 	if s.cmd != nil {
 		slog.Debug("stopping llama server")
 		if err := s.cmd.Process.Kill(); err != nil {
@@ -1127,6 +1153,7 @@ func (s *llmServer) Close() error {
 			slog.Debug("waiting for llama server to exit")
 			<-s.done
 		}
+		s.cmd = nil
 
 		slog.Debug("llama server stopped")
 	}
